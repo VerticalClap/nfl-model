@@ -1,63 +1,59 @@
 from __future__ import annotations
-import os
-import json
+import os, json
 import pandas as pd
-
 from .config import DATA_CACHE_DIR
-from .modeling import baseline_probs_from_odds
+from .odds import extract_moneylines, add_implied_probs
 
 def _load_schedule(cache: str) -> pd.DataFrame:
     p = os.path.join(cache, "schedule.csv")
     if not os.path.exists(p):
         raise FileNotFoundError(f"Missing {p} — run scripts/fetch_and_build.py first.")
-    df = pd.read_csv(p, low_memory=False)
-    return df
+    return pd.read_csv(p, low_memory=False)
 
 def _load_odds(cache: str) -> pd.DataFrame:
-    """Load odds if present and coerce to a simple home/away moneyline table."""
     p = os.path.join(cache, "odds_raw.json")
     if not os.path.exists(p):
-        return pd.DataFrame()  # ok; we’ll just skip odds-based probs
+        return pd.DataFrame()
     with open(p, "r", encoding="utf-8") as f:
         raw = json.load(f)
+    return extract_moneylines(raw)
 
-    # Shape odds into a flat table with home/away ML if available.
-    rows = []
-    for game in raw if isinstance(raw, list) else []:
-        # Provider formats vary; we extract best-effort moneylines
-        home, away = game.get("home_team"), game.get("away_team")
-        home_ml, away_ml = None, None
-        for b in game.get("bookmakers", []):
-            for mk in b.get("markets", []):
-                if mk.get("key") == "h2h":
-                    # Two outcomes: teams matched to prices
-                    for o in mk.get("outcomes", []):
-                        if o.get("name") == home and "price" in o:
-                            home_ml = o["price"]
-                        if o.get("name") == away and "price" in o:
-                            away_ml = o["price"]
-        rows.append({"home_team": home, "away_team": away, "home_ml": home_ml, "away_ml": away_ml})
-    return pd.DataFrame(rows)
+def kelly_fraction(p: float | None, ml: float | int | None, cap: float = 0.05) -> float:
+    if p is None or ml is None:
+        return 0.0
+    ml = float(ml)
+    b = (ml / 100.0) if ml >= 0 else (100.0 / (-ml))
+    f = (p * (b + 1) - 1) / b
+    if f <= 0:
+        return 0.0
+    return min(f, cap)
 
 def build_pick_sheet(cache: str = DATA_CACHE_DIR) -> pd.DataFrame:
     sched = _load_schedule(cache)
-    odds  = _load_odds(cache)
 
-    # Minimal join on home/away team strings if odds available
-    if not odds.empty:
-        merged = pd.merge(
-            sched, odds,
-            on=["home_team", "away_team"],
-            how="left",
-            suffixes=("", "_odds")
-        )
-    else:
-        merged = sched.copy()
+    # Keep only upcoming or current-season rows if schedule is multi-season
+    # nfl_data_py schedules have columns like "season", "week", "home_team", "away_team", "gameday"
+    cols_needed = [c for c in ["season","week","gameday","home_team","away_team","game_id"] if c in sched.columns]
+    sched_small = sched[cols_needed].copy() if cols_needed else sched.copy()
+
+    odds = _load_odds(cache)
+    if odds.empty:
+        merged = sched_small.copy()
         merged["home_ml"] = None
         merged["away_ml"] = None
+    else:
+        merged = pd.merge(
+            sched_small, odds,
+            on=["home_team","away_team"],
+            how="left",
+            suffixes=("","_odds")
+        )
 
-    probs = baseline_probs_from_odds(merged[["home_ml", "away_ml"]])
-    merged = pd.concat([merged.reset_index(drop=True), probs.reset_index(drop=True)], axis=1)
+    merged = add_implied_probs(merged)
+
+    # Kelly on both sides (informational)
+    merged["home_kelly_5pct"] = merged.apply(lambda r: kelly_fraction(r["home_prob"], r["home_ml"], 0.05), axis=1)
+    merged["away_kelly_5pct"] = merged.apply(lambda r: kelly_fraction(r["away_prob"], r["away_ml"], 0.05), axis=1)
 
     outp = os.path.join(cache, "pick_sheet.csv")
     merged.to_csv(outp, index=False)
