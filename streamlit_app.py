@@ -1,108 +1,66 @@
-# streamlit_app.py  —  NFL Picks Dashboard (public-repo mode)
-import os, io, requests, pandas as pd, numpy as np, streamlit as st
+import os
+import pandas as pd
+import streamlit as st
 
-# ===== repo settings (edit if you renamed) =====
-REPO_OWNER = "VerticalClap"
-REPO_NAME  = "nfl-model"
-BRANCH     = "main"
-
-REMOTE_BASE = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/{BRANCH}/data"
-LOCAL_DATA  = "./data"         # fallback if remote not reachable
-CACHE_TTL   = 60               # seconds; auto-refresh CSVs every minute
-
-# ---------- helpers ----------
-def moneyline_to_prob(ml):
-    if pd.isna(ml): return np.nan
-    ml = float(ml)
-    return 100/(ml+100) if ml >= 0 else (-ml)/((-ml)+100)
-
-@st.cache_data(show_spinner=False, ttl=CACHE_TTL)
-def load_csv(name: str) -> pd.DataFrame:
-    # try GitHub raw first (public), then local ./data
-    url = f"{REMOTE_BASE}/{name}"
-    try:
-        r = requests.get(url, timeout=30)
-        r.raise_for_status()
-        return pd.read_csv(io.BytesIO(r.content), low_memory=False)
-    except Exception:
-        p = os.path.join(LOCAL_DATA, name)
-        return pd.read_csv(p, low_memory=False) if os.path.exists(p) else pd.DataFrame()
-
-# ---------- UI ----------
-st.set_page_config(page_title="NFL Picks — Live Sheet", layout="wide")
+st.set_page_config(page_title="NFL Picks — Live", layout="wide")
 st.title("🏈 NFL Picks — Live Sheet")
 
-# quick manual reload
-if st.button("Reload data now"):
-    st.cache_data.clear()
+DATA_PATH = os.path.join("data", "pick_sheet.csv")  # pulled from GitHub by Actions
 
-ps = load_csv("pick_sheet.csv")
-sched = load_csv("schedule.csv")
+@st.cache_data(ttl=60)
+def load_data():
+    if os.path.exists(DATA_PATH):
+        df = pd.read_csv(DATA_PATH, low_memory=False)
+    else:
+        df = pd.DataFrame()
+    # parse dates, if present
+    if "gameday" in df.columns:
+        df["gameday"] = pd.to_datetime(df["gameday"], errors="coerce")
+    return df
 
-if ps.empty:
-    st.warning("No pick_sheet.csv in /data yet. Make sure the GitHub Action ran and pushed /data.")
+df = load_data()
+if df.empty:
+    st.warning("No pick_sheet.csv yet. Run the GitHub Action or the local build step.")
     st.stop()
 
-# normalize datatypes
-if "gameday" in ps.columns:
-    ps["gameday"] = pd.to_datetime(ps["gameday"], errors="coerce")
+# Filters
+col1, col2 = st.columns([2,2])
+with col1:
+    season = st.selectbox("Season", sorted(df["season"].dropna().unique()))
+with col2:
+    weeks = sorted(df.loc[df["season"]==season, "week"].dropna().unique())
+    week = st.selectbox("Week", weeks)
 
-# derive implied probability columns if moneylines present
-if "home_ml" in ps.columns and "home_prob" not in ps.columns:
-    ps["home_prob_implied"] = ps["home_ml"].apply(moneyline_to_prob)
-if "away_ml" in ps.columns and "away_prob" not in ps.columns:
-    ps["away_prob_implied"] = ps["away_ml"].apply(moneyline_to_prob)
+show = df[(df["season"]==season) & (df["week"]==week)].copy()
+if show.empty:
+    st.info("No rows for the chosen filters.")
+    st.stop()
 
-# compute edges if both model/fair probs and implied probs exist
-for side in ["home","away"]:
-    mp = f"{side}_prob"             # fair / de-vig prob from pipeline
-    ip = f"{side}_prob_implied"     # implied from moneyline
-    if mp in ps.columns and ip in ps.columns:
-        ps[f"{side}_edge"] = ps[mp] - ps[ip]
+# Tabs: Moneyline vs Spread
+tab1, tab2 = st.tabs(["Moneyline (Model vs Market)", "Spread / ATS"])
 
-# filters
-left, right = st.columns([3,2])
-with left:
-    st.subheader("Filters")
-    seasons = sorted([int(x) for x in ps["season"].dropna().unique().tolist()]) if "season" in ps else []
-    default_season = max(seasons) if seasons else None
-    season = st.selectbox("Season", seasons, index=seasons.index(default_season) if seasons else 0)
-
-    week_opts = sorted(ps.loc[ps["season"]==season, "week"].dropna().unique().tolist()) if season is not None else []
-    week = st.selectbox("Week", week_opts, index=len(week_opts)-1 if week_opts else 0)
-
-    view = ps.copy()
-    if season is not None: view = view[view["season"]==season]
-    if week is not None:   view = view[view["week"]==week]
-
-    # show main table
-    show_cols = [c for c in [
-        "season","week","gameday","home_team","away_team",
-        "home_ml","away_ml",
-        "home_prob","away_prob","home_prob_implied","away_prob_implied",
+with tab1:
+    st.subheader("Model vs Market — Moneyline")
+    cols = [
+        "gameday","home_team","away_team",
+        "home_ml","away_ml","home_prob","away_prob",          # market fair
+        "home_prob_model","away_prob_model",                  # model
         "home_edge","away_edge",
-        "home_kelly_5pct","away_kelly_5pct",
-        "temp_f","wind_mph","gust_mph","precip_prob","qb_out","ol_starters_out","db_starters_out"
-    ] if c in view.columns]
+        "home_kelly_5pct","away_kelly_5pct"
+    ]
+    present = [c for c in cols if c in show.columns]
+    st.dataframe(show[present].sort_values(["gameday","home_team"]))
 
-    st.subheader("Pick Sheet")
-    st.dataframe(
-        view[show_cols].sort_values(
-            by=[c for c in ["season","week","gameday","home_edge"] if c in show_cols],
-            ascending=[True, True, True, False] if "home_edge" in show_cols else True
-        ),
-        use_container_width=True
-    )
-
-with right:
-    st.subheader("Calibration snapshot")
-    # If you later log model preds vs actuals, this will populate
-    if {"pred","actual"}.issubset(ps.columns):
-        bins = pd.cut(ps["pred"], bins=np.linspace(0,1,11))
-        calib = ps.groupby(bins)["actual"].mean().rename("empirical").to_frame()
-        calib["count"] = ps.groupby(bins).size()
-        st.dataframe(calib, use_container_width=True)
-    else:
-        st.info("Calibration will display once predictions vs outcomes are logged.")
+with tab2:
+    st.subheader("Model vs Market — Spread (ATS)")
+    cols = [
+        "gameday","home_team","away_team",
+        "model_spread_home",                                  # model spread (home minus away)
+        "home_spread","away_spread","home_spread_price","away_spread_price",
+        "home_cover_prob","away_cover_prob",                  # market fair cover probs (if prices)
+        "spread_edge_pts"
+    ]
+    present = [c for c in cols if c in show.columns]
+    st.dataframe(show[present].sort_values(["gameday","home_team"]))
 
 st.caption("Data auto-loads from the repo’s /data folder on GitHub (auto-refreshed every 60s).")
