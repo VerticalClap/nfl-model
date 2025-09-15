@@ -31,18 +31,15 @@ def kelly_fraction(p: float | None, ml: float | int | None, cap: float = 0.05) -
 def build_pick_sheet(cache: str = DATA_CACHE_DIR) -> pd.DataFrame:
     sched = _load_schedule(cache)
 
-    # ✅ Only keep current season
+    # ✅ current season only + upcoming games
     current_year = pd.Timestamp.today().year
     if "season" in sched.columns:
         sched = sched[sched["season"] == current_year]
-
-    # ✅ Only keep games today or later
     if "gameday" in sched.columns:
         sched["gameday"] = pd.to_datetime(sched["gameday"], errors="coerce")
         today = pd.Timestamp.today().normalize()
         sched = sched[sched["gameday"] >= today]
 
-    # Keep only needed columns
     cols_needed = [c for c in ["season","week","gameday","home_team","away_team","game_id"] if c in sched.columns]
     sched_small = sched[cols_needed].copy() if cols_needed else sched.copy()
 
@@ -61,11 +58,11 @@ def build_pick_sheet(cache: str = DATA_CACHE_DIR) -> pd.DataFrame:
 
     merged = add_implied_probs(merged)
 
-    # Kelly bet sizing
-    merged["home_kelly_5pct"] = merged.apply(lambda r: kelly_fraction(r["home_prob"], r["home_ml"], 0.05), axis=1)
-    merged["away_kelly_5pct"] = merged.apply(lambda r: kelly_fraction(r["away_prob"], r["away_ml"], 0.05), axis=1)
+    # Kelly sizing (5% cap)
+    merged["home_kelly_5pct"] = merged.apply(lambda r: kelly_fraction(r.get("home_prob"), r.get("home_ml"), 0.05), axis=1)
+    merged["away_kelly_5pct"] = merged.apply(lambda r: kelly_fraction(r.get("away_prob"), r.get("away_ml"), 0.05), axis=1)
 
     outp = os.path.join(cache, "pick_sheet.csv")
     merged.to_csv(outp, index=False)
-    print(f"Wrote {outp} ({len(merged)} rows)")
+    print(f"[pick_sheet] wrote {outp} ({len(merged)} rows)")
     return merged
