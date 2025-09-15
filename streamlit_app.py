@@ -9,8 +9,10 @@ REMOTE_BASE = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/{BRAN
 LOCAL_CACHE = os.environ.get("DATA_CACHE_DIR", "./cache")
 
 # ===== Data loaders =====
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=60)  # auto-refresh every 60s
 def load_csv(path: str) -> pd.DataFrame:
+    ...
+
     url = f"{REMOTE_BASE}/{path}"
     try:
         r = requests.get(url, timeout=30)
