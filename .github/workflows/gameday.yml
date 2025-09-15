@@ -1,7 +1,7 @@
 name: Gameday Hourly
 on:
   schedule:
-    - cron: "0 * * * 0,1"  # hourly Sun/Mon UTC
+    - cron: "0 * * * 0,1"  # Hourly on Sundays & Mondays (UTC)
   workflow_dispatch:
 
 jobs:
@@ -27,10 +27,19 @@ jobs:
       - name: Refresh odds & schedule
         env:
           THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
-          NWS_USER_AGENT: ${{ secrets.NWS_USER_AGENT }}
+          NWS_USER_AGENT: ${{ secrets[NWS_USER_AGENT] }}
           DATA_CACHE_DIR: ./cache
         run: |
           python scripts/fetch_and_build.py
+
+      - name: Build pick sheet
+        env:
+          DATA_CACHE_DIR: ./cache
+        run: |
+          python - << "PY"
+          from nfl_model.pipeline import build_pick_sheet
+          build_pick_sheet("./cache")
+          PY
 
       - name: Upload cache (warn if empty)
         uses: actions/upload-artifact@v4
