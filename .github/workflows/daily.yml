@@ -1,0 +1,30 @@
+﻿name: Daily Data Refresh
+on:
+  schedule:
+    - cron: "0 13 * * *"   # 09:00 ET
+  workflow_dispatch:
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install python-dotenv requests duckdb
+      - name: Fetch schedule & odds
+        env:
+          THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
+          NWS_USER_AGENT: ${{ secrets.NWS_USER_AGENT }}
+          DATA_CACHE_DIR: ./cache
+        run: |
+          python scripts/fetch_and_build.py
+      - name: Upload cache
+        uses: actions/upload-artifact@v4
+        with:
+          name: cache_outputs
+          path: cache/**
