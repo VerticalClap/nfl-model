@@ -2,12 +2,12 @@
 from __future__ import annotations
 import pandas as pd
 import nfl_data_py as nfl
+import numpy as np
 
 TEAM_FIX = {"LA":"LAR","STL":"LAR","SD":"LAC","OAK":"LV"}
+def _fix(s: pd.Series) -> pd.Series: return s.replace(TEAM_FIX)
 
-def _fix(s: pd.Series) -> pd.Series:
-    return s.replace(TEAM_FIX)
-
+# ----- Elo core -----
 def _expected_home_prob(elo_home: float, elo_away: float, hfa: float = 55.0) -> float:
     diff = (elo_home + hfa) - elo_away
     return 1.0 / (1.0 + 10.0 ** (-diff / 400.0))
@@ -21,8 +21,10 @@ def _train_elo(years: range, k=20.0, hfa=55.0) -> dict[str,float]:
     g = nfl.import_schedules(list(years))
     g = g[(g.home_score.notna()) & (g.away_score.notna())].copy()
     g["home_team"] = _fix(g["home_team"]); g["away_team"] = _fix(g["away_team"])
-    if "gameday" in g: g["gameday"] = pd.to_datetime(g["gameday"], errors="coerce"); g = g.sort_values("gameday")
-    else: g = g.sort_values(["season","week"])
+    if "gameday" in g:
+        g["gameday"] = pd.to_datetime(g["gameday"], errors="coerce"); g = g.sort_values("gameday")
+    else:
+        g = g.sort_values(["season","week"])
     r: dict[str,float] = {}
     def get(t): return r.get(t, 1500.0)
     for _, row in g.iterrows():
@@ -41,4 +43,11 @@ def train_elo_and_predict(upcoming: pd.DataFrame, train_start=2018, train_end=20
         return _expected_home_prob(eh, ea, hfa)
     df["home_prob_model"] = df.apply(row_p, axis=1)
     df["away_prob_model"] = 1.0 - df["home_prob_model"]
-    return df[["home_team","away_team","home_prob_model","away_prob_model"]]
+
+    # --- provisional model spread from win prob (calibrated constant helps) ---
+    # Using a smooth link: margin ≈ C * logit(p), with C≈6.5–7.0 often reasonable.
+    # We'll tune C later with backtesting.
+    C = 6.8
+    logit = np.log(df["home_prob_model"]/(1-df["home_prob_model"]).clip(1e-6,1-1e-6))
+    df["model_spread_home"] = (C * logit).round(1)  # negative means favorite by that many points
+    return df[["home_team","away_team","home_prob_model","away_prob_model","model_spread_home"]]
