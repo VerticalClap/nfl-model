@@ -1,169 +1,79 @@
 # nfl_model/odds.py
+from __future__ import annotations
 import math
-import re
 import pandas as pd
-from statistics import median
 
-# Map bookmaker team names -> nfl_data_py abbreviations
-TEAM_MAP = {
-    # AFC East
-    "buffalo bills": "BUF",
-    "miami dolphins": "MIA",
-    "new england patriots": "NE",
-    "ny jets": "NYJ", "new york jets": "NYJ",
-    # AFC North
-    "baltimore ravens": "BAL",
-    "cincinnati bengals": "CIN",
-    "cleveland browns": "CLE",
-    "pittsburgh steelers": "PIT",
-    # AFC South
-    "houston texans": "HOU",
-    "indianapolis colts": "IND",
-    "jacksonville jaguars": "JAX", "jacksonville jags": "JAX",
-    "tennessee titans": "TEN",
-    # AFC West
-    "denver broncos": "DEN",
-    "kansas city chiefs": "KC", "kansas city": "KC",
-    "las vegas raiders": "LV", "oakland raiders": "LV",
-    "la chargers": "LAC", "los angeles chargers": "LAC", "san diego chargers": "LAC",
-    # NFC East
-    "dallas cowboys": "DAL",
-    "ny giants": "NYG", "new york giants": "NYG",
-    "philadelphia eagles": "PHI",
-    "washington commanders": "WAS", "washington football team": "WAS", "washington redskins": "WAS", "washington": "WAS",
-    # NFC North
-    "chicago bears": "CHI",
-    "detroit lions": "DET",
-    "green bay packers": "GB",
-    "minnesota vikings": "MIN",
-    # NFC South
-    "atlanta falcons": "ATL",
-    "carolina panthers": "CAR",
-    "new orleans saints": "NO", "new orleans": "NO",
-    "tampa bay buccaneers": "TB", "tampa bay": "TB", "tampa bay bcs": "TB",
-    # NFC West
-    "arizona cardinals": "ARI",
-    "la rams": "LAR", "los angeles rams": "LAR", "st. louis rams": "LAR",
-    "san francisco 49ers": "SF", "san francisco": "SF",
-    "seattle seahawks": "SEA",
-}
+def american_to_prob(ml: float | int) -> float:
+    ml = float(ml)
+    return (ml / (ml + 100.0)) if ml >= 0 else (100.0 / (100.0 - ml))
 
-# Some books omit city; try mascot-only fallbacks
-MASCOT_FALLBACK = {
-    "patriots": "NE", "jets": "NYJ", "bills": "BUF", "dolphins": "MIA",
-    "ravens": "BAL", "bengals": "CIN", "browns": "CLE", "steelers": "PIT",
-    "texans": "HOU", "colts": "IND", "jaguars": "JAX", "jags": "JAX", "titans": "TEN",
-    "broncos": "DEN", "chiefs": "KC", "raiders": "LV", "chargers": "LAC",
-    "cowboys": "DAL", "giants": "NYG", "eagles": "PHI", "commanders": "WAS",
-    "bears": "CHI", "lions": "DET", "packers": "GB", "vikings": "MIN",
-    "falcons": "ATL", "panthers": "CAR", "saints": "NO", "buccaneers": "TB", "bucs": "TB",
-    "cardinals": "ARI", "rams": "LAR", "49ers": "SF", "niners": "SF", "seahawks": "SEA",
-}
+def prob_to_american(p: float) -> float:
+    if p <= 0 or p >= 1: return float("nan")
+    return 100.0 * p / (1 - p) if p < 0.5 else -100.0 * (1 - p) / p
 
-def _clean(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"[^\w\s]", "", s)  # drop punctuation
-    s = re.sub(r"\s+", " ", s)
-    return s
+def remove_vig(ph: float, pa: float) -> tuple[float,float]:
+    s = ph + pa
+    if s <= 0: return (float("nan"), float("nan"))
+    return ph/s, pa/s
 
-def normalize_team(name: str) -> str | None:
-    if not name:
-        return None
-    s = _clean(name)
-    # direct map
-    if s in TEAM_MAP:
-        return TEAM_MAP[s]
-    # try mascot last token
-    parts = s.split()
-    if parts:
-        m = parts[-1]
-        if m in MASCOT_FALLBACK:
-            return MASCOT_FALLBACK[m]
-    # try without words like "the"
-    s2 = s.replace("the ", "")
-    if s2 in TEAM_MAP:
-        return TEAM_MAP[s2]
-    return None  # unknown
+def _median_or_none(vals: list[float]) -> float | None:
+    vals = [float(v) for v in vals if v is not None]
+    if not vals: return None
+    return float(pd.Series(vals).median())
 
-def moneyline_to_prob(ml):
-    if ml is None:
-        return None
-    try:
-        ml = float(ml)
-    except Exception:
-        return None
-    return 100.0/(ml+100.0) if ml >= 0 else (-ml)/((-ml)+100.0)
-
-def prob_to_moneyline(p):
-    if p is None or p <= 0 or p >= 1:
-        return None
-    return -round(100*p/(1-p)) if p >= 0.5 else round(100*(1-p)/p)
-
-def remove_vig_two_way(p_home, p_away):
-    if p_home is None or p_away is None:
-        return (None, None)
-    s = p_home + p_away
-    if not s or s <= 0:
-        return (None, None)
-    return (p_home/s, p_away/s)
-
-def extract_consensus_moneylines(odds_raw: list) -> pd.DataFrame:
-    """
-    Convert The Odds API response into median moneylines per game,
-    normalize team names to nfl_data_py abbreviations for reliable merging.
-    """
+def extract_moneylines(raw: list | dict) -> pd.DataFrame:
+    # The Odds API v4 payload (events with bookmakers & markets)
+    events = raw if isinstance(raw, list) else raw.get("data", [])
     rows = []
-    for game in odds_raw or []:
-        home_raw = game.get("home_team")
-        away_raw = game.get("away_team")
-        home = normalize_team(home_raw)
-        away = normalize_team(away_raw)
-        if not home or not away:
-            # skip games we can't map
-            continue
-
+    for ev in events:
+        ht, at = ev.get("home_team"), ev.get("away_team")
+        if not ht or not at: continue
         home_prices, away_prices = [], []
-        for b in game.get("bookmakers", []):
-            for mk in b.get("markets", []):
-                if mk.get("key") != "h2h":
-                    continue
-                for o in mk.get("outcomes", []):
-                    nm, price = o.get("name"), o.get("price")
-                    team_abbr = normalize_team(nm)
-                    if team_abbr == home and price is not None:
-                        home_prices.append(price)
-                    elif team_abbr == away and price is not None:
-                        away_prices.append(price)
-
-        home_ml = median(home_prices) if home_prices else None
-        away_ml = median(away_prices) if away_prices else None
-        ph_raw = moneyline_to_prob(home_ml)
-        pa_raw = moneyline_to_prob(away_ml)
-        ph_fair, pa_fair = remove_vig_two_way(ph_raw, pa_raw)
-
-        rows.append({
-            "home_team": home, "away_team": away,
-            "home_ml": home_ml, "away_ml": away_ml,
-            "home_prob": ph_fair, "away_prob": pa_fair,
-        })
-
+        for bk in ev.get("bookmakers", []):
+            for m in bk.get("markets", []):
+                if m.get("key") != "h2h": continue
+                for o in m.get("outcomes", []):
+                    team, price = o.get("name"), o.get("price")
+                    if team in (ht, at) and price is not None:
+                        if team == ht: home_prices.append(price)
+                        else: away_prices.append(price)
+        hml, aml = _median_or_none(home_prices), _median_or_none(away_prices)
+        rows.append({"home_team": ht, "away_team": at, "home_ml": hml, "away_ml": aml})
     return pd.DataFrame(rows)
 
-# Back-compat for pipeline
-def extract_moneylines(raw): 
-    return extract_consensus_moneylines(raw)
+def extract_spreads(raw: list | dict) -> pd.DataFrame:
+    events = raw if isinstance(raw, list) else raw.get("data", [])
+    rows = []
+    for ev in events:
+        ht, at = ev.get("home_team"), ev.get("away_team")
+        if not ht or not at: continue
+        home_lines, away_lines, home_prices, away_prices = [], [], [], []
+        for bk in ev.get("bookmakers", []):
+            for m in bk.get("markets", []):
+                if m.get("key") != "spreads": continue
+                for o in m.get("outcomes", []):
+                    team, point, price = o.get("name"), o.get("point"), o.get("price")
+                    if team == ht:
+                        home_lines.append(point); home_prices.append(price)
+                    elif team == at:
+                        away_lines.append(point); away_prices.append(price)
+        rows.append({
+            "home_team": ht, "away_team": at,
+            "home_spread": _median_or_none(home_lines),
+            "away_spread": _median_or_none(away_lines),
+            "home_spread_price": _median_or_none(home_prices),
+            "away_spread_price": _median_or_none(away_prices),
+        })
+    return pd.DataFrame(rows)
 
 def add_implied_probs(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    if "home_ml" in out:
-        out["home_prob_raw"] = out["home_ml"].apply(moneyline_to_prob)
-    if "away_ml" in out:
-        out["away_prob_raw"] = out["away_ml"].apply(moneyline_to_prob)
-    if "home_prob_raw" in out and "away_prob_raw" in out:
-        fair = out.apply(
-            lambda r: pd.Series(remove_vig_two_way(r["home_prob_raw"], r["away_prob_raw"]),
-                                index=["home_prob", "away_prob"]),
-            axis=1
-        )
-        out[["home_prob", "away_prob"]] = fair
+    if "home_ml" in out and "away_ml" in out:
+        ph_raw = out["home_ml"].apply(lambda x: american_to_prob(x) if pd.notna(x) else float("nan"))
+        pa_raw = out["away_ml"].apply(lambda x: american_to_prob(x) if pd.notna(x) else float("nan"))
+        out["home_prob_raw"], out["away_prob_raw"] = ph_raw, pa_raw
+        # fair (vig-removed)
+        fair = [remove_vig(h, a) if pd.notna(h) and pd.notna(a) else (float("nan"), float("nan")) for h, a in zip(ph_raw, pa_raw)]
+        out["home_prob"] = [f[0] for f in fair]
+        out["away_prob"] = [f[1] for f in fair]
     return out
