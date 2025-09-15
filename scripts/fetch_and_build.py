@@ -1,55 +1,24 @@
-import os, json, time, requests, pandas as pd
-
-# New primary source: nflverse-data releases
-SCHEDULE_URLS = [
-    # Official release (CSV)
-    "https://github.com/nflverse/nflverse-data/releases/download/schedules/schedules.csv",
-    # Same release, gzipped variant (sometimes present)
-    "https://github.com/nflverse/nflverse-data/releases/download/schedules/schedules.csv.gz",
-    # Legacy mirrors as last resort
-    "https://raw.githubusercontent.com/nflverse/nflfastR-data/master/schedules/schedules.csv.gz",
-    "https://github.com/nflverse/nflfastR-data/raw/master/schedules/schedules.csv.gz",
-]
+import os, json, pandas as pd
+import nfl_data_py as nfl
 
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 
 def ensure_cache():
-    cache = os.environ.get("DATA_CACHE_DIR","./cache")
+    cache = os.environ.get("DATA_CACHE_DIR", "./cache")
     os.makedirs(cache, exist_ok=True)
     return cache
 
-def _download(url, timeout=60):
-    r = requests.get(url, timeout=timeout)
-    r.raise_for_status()
-    return r
-
-def fetch_schedule(cache, max_retries=2, pause=2.0):
-    out_csv = os.path.join(cache, "schedule.csv")
-    last_err = None
-    for url in SCHEDULE_URLS:
-        for attempt in range(1, max_retries+1):
-            try:
-                print(f"Fetching schedule (attempt {attempt}) from {url}")
-                r = _download(url, timeout=60)
-                # Decide how to read: csv vs csv.gz
-                if url.endswith(".csv.gz"):
-                    import io, gzip
-                    df = pd.read_csv(io.BytesIO(gzip.decompress(r.content)))
-                else:
-                    # Some GitHub release assets need .content, not .text
-                    import io
-                    df = pd.read_csv(io.BytesIO(r.content))
-                df.to_csv(out_csv, index=False)
-                print(f"Wrote {out_csv} ({len(df)} rows)")
-                return df
-            except Exception as e:
-                last_err = e
-                print(f"  failed: {e}")
-                time.sleep(pause)
-        print("  trying next URL…")
-    raise RuntimeError(f"All schedule URLs failed. Last error: {last_err}")
+def fetch_schedule(cache):
+    # Fetch full schedule (all seasons available)
+    print("Fetching schedule via nfl_data_py…")
+    df = nfl.import_schedules([2020, 2021, 2022, 2023, 2024])  # add seasons as needed
+    out = os.path.join(cache, "schedule.csv")
+    df.to_csv(out, index=False)
+    print(f"Wrote {out} ({len(df)} rows)")
+    return df
 
 def fetch_odds(api_key):
+    import requests
     url = f"{ODDS_BASE}/sports/americanfootball_nfl/odds"
     r = requests.get(url, params={
         "apiKey": api_key,
