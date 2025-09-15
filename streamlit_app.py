@@ -4,6 +4,8 @@ import os, io, requests, pandas as pd, numpy as np, streamlit as st
 REPO_OWNER = "VerticalClap"
 REPO_NAME  = "nfl-model"
 BRANCH     = "main"
+if st.button("Reload data now"):
+    st.cache_data.clear()
 
 REMOTE_BASE = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/{BRANCH}/data"
 LOCAL_CACHE = os.environ.get("DATA_CACHE_DIR", "./cache")
