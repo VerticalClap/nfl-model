@@ -1,23 +1,28 @@
-﻿name: Daily Data Refresh
+name: Daily Data Refresh
 on:
   schedule:
     - cron: "0 13 * * *"   # 09:00 ET
   workflow_dispatch:
+
 jobs:
   refresh:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-- name: Install MINIMAL deps (fetch only)
-  run: |
-    python -m pip install --upgrade pip
-    pip install pandas pyarrow requests duckdb python-dotenv nfl_data_py
 
-- name: Ensure cache folder
-  run: mkdir -p cache
+      - name: Install MINIMAL deps (fetch only)
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas pyarrow requests duckdb python-dotenv nfl_data_py
+
+      - name: Ensure cache folder
+        run: mkdir -p cache
 
       - name: Fetch schedule & odds
         env:
@@ -26,8 +31,10 @@ jobs:
           DATA_CACHE_DIR: ./cache
         run: |
           python scripts/fetch_and_build.py
-      - name: Upload cache
+
+      - name: Upload cache (warn if empty)
         uses: actions/upload-artifact@v4
         with:
           name: cache_outputs
           path: cache/**
+          if-no-files-found: warn
