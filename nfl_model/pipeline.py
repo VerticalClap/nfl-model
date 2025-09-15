@@ -1,14 +1,43 @@
+# nfl_model/pipeline.py
 from __future__ import annotations
 import os, json
 import pandas as pd
 from .config import DATA_CACHE_DIR
 from .odds import extract_moneylines, add_implied_probs
 
+# Normalize old/ambiguous team codes in schedules to current abbreviations
+TEAM_FIX = {
+    "LA": "LAR",     # legacy Rams code in some schedules
+    "SD": "LAC",     # old Chargers
+    "OAK": "LV",     # old Raiders
+    "STL": "LAR",    # old Rams
+    # (add more if you ever see them)
+}
+
+def _fix_abbr(s: pd.Series) -> pd.Series:
+    return s.replace(TEAM_FIX)
+
 def _load_schedule(cache: str) -> pd.DataFrame:
     p = os.path.join(cache, "schedule.csv")
     if not os.path.exists(p):
         raise FileNotFoundError(f"Missing {p} — run scripts/fetch_and_build.py first.")
-    return pd.read_csv(p, low_memory=False)
+    df = pd.read_csv(p, low_memory=False)
+
+    # Ensure upcoming/current season only
+    if "season" in df.columns:
+        df = df[df["season"] == pd.Timestamp.today().year]
+    if "gameday" in df.columns:
+        df["gameday"] = pd.to_datetime(df["gameday"], errors="coerce")
+        today = pd.Timestamp.today().normalize()
+        df = df[df["gameday"] >= today]
+
+    # Fix any legacy abbreviations before merging with odds
+    if "home_team" in df.columns and "away_team" in df.columns:
+        df["home_team"] = _fix_abbr(df["home_team"])
+        df["away_team"] = _fix_abbr(df["away_team"])
+
+    keep = [c for c in ["season","week","gameday","home_team","away_team","game_id"] if c in df.columns]
+    return df[keep].sort_values(["week","gameday","home_team","away_team"]).reset_index(drop=True)
 
 def _load_odds(cache: str) -> pd.DataFrame:
     p = os.path.join(cache, "odds_raw.json")
@@ -16,7 +45,7 @@ def _load_odds(cache: str) -> pd.DataFrame:
         return pd.DataFrame()
     with open(p, "r", encoding="utf-8") as f:
         raw = json.load(f)
-    return extract_moneylines(raw)
+    return extract_moneylines(raw)  # returns home_ml/away_ml + fair probs
 
 def kelly_fraction(p: float | None, ml: float | int | None, cap: float = 0.05) -> float:
     if p is None or ml is None:
@@ -30,35 +59,27 @@ def kelly_fraction(p: float | None, ml: float | int | None, cap: float = 0.05) -
 
 def build_pick_sheet(cache: str = DATA_CACHE_DIR) -> pd.DataFrame:
     sched = _load_schedule(cache)
-
-    # ✅ current season only + upcoming games
-    current_year = pd.Timestamp.today().year
-    if "season" in sched.columns:
-        sched = sched[sched["season"] == current_year]
-    if "gameday" in sched.columns:
-        sched["gameday"] = pd.to_datetime(sched["gameday"], errors="coerce")
-        today = pd.Timestamp.today().normalize()
-        sched = sched[sched["gameday"] >= today]
-
-    cols_needed = [c for c in ["season","week","gameday","home_team","away_team","game_id"] if c in sched.columns]
-    sched_small = sched[cols_needed].copy() if cols_needed else sched.copy()
-
     odds = _load_odds(cache)
+
     if odds.empty:
-        merged = sched_small.copy()
+        merged = sched.copy()
         merged["home_ml"] = None
         merged["away_ml"] = None
+        merged["home_prob"] = None
+        merged["away_prob"] = None
     else:
+        # Left join so we keep schedule rows even if some games lack lines yet
         merged = pd.merge(
-            sched_small, odds,
+            sched, odds,
             on=["home_team","away_team"],
             how="left",
             suffixes=("","_odds")
         )
 
+    # Add raw implied + fair probabilities (no-op if MLs missing)
     merged = add_implied_probs(merged)
 
-    # Kelly sizing (5% cap)
+    # Kelly sizing (cap 5%)
     merged["home_kelly_5pct"] = merged.apply(lambda r: kelly_fraction(r.get("home_prob"), r.get("home_ml"), 0.05), axis=1)
     merged["away_kelly_5pct"] = merged.apply(lambda r: kelly_fraction(r.get("away_prob"), r.get("away_ml"), 0.05), axis=1)
 
