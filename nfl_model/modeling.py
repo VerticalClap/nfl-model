@@ -1,31 +1,31 @@
-﻿import numpy as np
-from lightgbm import LGBMClassifier
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.isotonic import IsotonicRegression
+import numpy as np
+import pandas as pd
 
-def train_with_timeseries_cv(X, y, n_splits=5, random_state=42):
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    preds = np.zeros(len(y), dtype=float)
-    models = []
-    for i, (tr, va) in enumerate(tscv.split(X)):
-        m = LGBMClassifier(
-            n_estimators=150,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            random_state=random_state+i
-        )
-        m.fit(X.iloc[tr], y.iloc[tr])
-        p = m.predict_proba(X.iloc[va])[:,1]
-        preds[va] = p
-        models.append(m)
-    return models, preds
+def moneyline_to_prob(ml: float) -> float:
+    """
+    Convert American moneyline to implied win probability (vig not removed).
+    """
+    ml = float(ml)
+    if ml >= 0:
+        return 100.0 / (ml + 100.0)
+    return (-ml) / ((-ml) + 100.0)
 
-def calibrate(models, X_valid, y_valid):
-    pred = np.mean([m.predict_proba(X_valid)[:,1] for m in models], axis=0)
-    iso = IsotonicRegression(out_of_bounds="clip")
-    iso.fit(pred, y_valid)
-    return iso
-
-def predict_ensemble(models, X):
-    return np.mean([m.predict_proba(X)[:,1] for m in models], axis=0)
+def baseline_probs_from_odds(odds_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Given an odds table with home/away moneylines, compute implied probs.
+    Expected columns (if present): home_team, away_team, home_ml, away_ml
+    Returns a dataframe with columns: home_prob, away_prob
+    """
+    df = odds_df.copy()
+    if "home_ml" in df and "away_ml" in df:
+        df["home_prob_raw"] = df["home_ml"].apply(moneyline_to_prob)
+        df["away_prob_raw"] = df["away_ml"].apply(moneyline_to_prob)
+        # Simple de-vig: normalize so the two probs sum to 1
+        s = df["home_prob_raw"] + df["away_prob_raw"]
+        df["home_prob"] = df["home_prob_raw"] / s
+        df["away_prob"] = df["away_prob_raw"] / s
+    else:
+        # If moneylines aren’t present yet, return empty columns
+        df["home_prob"] = np.nan
+        df["away_prob"] = np.nan
+    return df[["home_prob", "away_prob"]]
