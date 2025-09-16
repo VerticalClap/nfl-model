@@ -1,37 +1,29 @@
-# scripts/fetch_and_build.py
-import os, json, requests, pandas as pd
+import os
+import nfl_data_py as nfl
+import requests
+import json
+import pandas as pd
+from nfl_model.pipeline import build_pick_sheet
 
-NFL_SCHED = "https://github.com/nflverse/nflfastR-data/raw/master/schedules/schedules.csv.gz"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 
-def ensure_cache():
-    cache = os.environ.get("DATA_CACHE_DIR","./cache")
-    os.makedirs(cache, exist_ok=True)
-    return cache
 
-def fetch_schedule(cache):
-    p = os.path.join(cache, "schedules.csv.gz")
-    if not os.path.exists(p):
-        r = requests.get(NFL_SCHED, timeout=60)
-        r.raise_for_status()
-        with open(p, "wb") as f:
-            f.write(r.content)
-    df = pd.read_csv(p, compression="gzip", low_memory=False)
-    # keep current + future seasons only (optional)
-    df = df[df["season"] >= 2025].copy()
-    out = os.path.join(cache, "schedule.csv")
-    df.to_csv(out, index=False)
-    print(f"[schedule] wrote {out} ({len(df)} rows)")
-    return df
+def fetch_schedule(season=2025):
+    """Fetch NFL schedule for a given season."""
+    sched = nfl.import_schedules([season])
+    return sched
+
 
 def fetch_odds(api_key, markets="h2h,spreads", regions="us"):
+    """Fetch odds data from The Odds API for NFL games."""
     url = f"{ODDS_BASE}/sports/americanfootball_nfl/odds"
     r = requests.get(
         url,
         params={
             "apiKey": api_key,
-            "regions": regions,           # us books
-            "markets": markets,           # <-- include spreads
+            "regions": regions,
+            "markets": markets,       # moneylines and spreads
+            "bookmakers": "draftkings",  # only DraftKings for consistency
             "oddsFormat": "american",
         },
         timeout=60,
@@ -39,18 +31,40 @@ def fetch_odds(api_key, markets="h2h,spreads", regions="us"):
     r.raise_for_status()
     return r.json()
 
-if __name__ == "__main__":
-    cache = ensure_cache()
-    fetch_schedule(cache)
 
-    key = os.environ.get("THE_ODDS_API_KEY")
-    if key:
-        try:
-            data = fetch_odds(key, markets="h2h,spreads")  # ensure spreads requested
-            with open(os.path.join(cache, "odds_raw.json"), "w", encoding="utf-8") as f:
-                json.dump(data, f)
-            print("[odds] wrote cache/odds_raw.json")
-        except Exception as e:
-            print("[odds] fetch failed:", e)
-    else:
-        print("[odds] skipped: THE_ODDS_API_KEY not set")
+def main():
+    season = 2025
+    cache_dir = "./cache"
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # 1. Fetch schedule
+    print(f"[schedule] fetching NFL schedule for {season}…")
+    sched = fetch_schedule(season)
+    sched_path = os.path.join(cache_dir, "schedule.csv")
+    sched.to_csv(sched_path, index=False)
+    print(f"[schedule] wrote {sched_path} ({len(sched)} rows)")
+
+    # 2. Fetch odds
+    api_key = os.environ.get("THE_ODDS_API_KEY")
+    if not api_key:
+        print("[odds] ERROR: THE_ODDS_API_KEY not set")
+        return
+
+    try:
+        data = fetch_odds(api_key)
+        odds_path = os.path.join(cache_dir, "odds_raw.json")
+        with open(odds_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        print(f"[odds] wrote {odds_path}")
+    except Exception as e:
+        print("[odds] fetch failed:", e)
+
+    # 3. Build pick sheet
+    try:
+        build_pick_sheet(cache_dir)
+    except Exception as e:
+        print("[pick_sheet] build failed:", e)
+
+
+if __name__ == "__main__":
+    main()
