@@ -1,106 +1,97 @@
 # streamlit_app.py
 import os
+import time
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="NFL Picks — Live", layout="wide")
-st.title("🏈 NFL Picks — Live Sheet")
-
 DATA_PATH = os.path.join("data", "pick_sheet.csv")
 
+st.set_page_config(page_title="NFL Picks — Live Sheet", layout="wide")
+st.title("🏈 NFL Picks — Live Sheet")
+
 @st.cache_data(ttl=60)
-def load_data(path: str) -> pd.DataFrame:
-    if not os.path.exists(path):
+def load_df():
+    if not os.path.exists(DATA_PATH):
         return pd.DataFrame()
-    df = pd.read_csv(path, low_memory=False)
+    df = pd.read_csv(DATA_PATH, low_memory=False)
+    # basic cleaning
     if "gameday" in df.columns:
         df["gameday"] = pd.to_datetime(df["gameday"], errors="coerce")
-    # Convert numeric-likes
-    for c in ["home_ml","away_ml","home_prob","away_prob",
-              "home_spread","away_spread","home_spread_price","away_spread_price",
-              "home_cover_prob","away_cover_prob",
-              "total_points","over_price","under_price","over_prob","under_prob",
-              "home_rest_days","away_rest_days","rest_delta","travel_km","travel_dir_km"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
-df = load_data(DATA_PATH)
+df = load_df()
 if df.empty:
-    st.warning("No pick_sheet.csv yet. Run the GitHub Action or the local build step.")
+    st.warning("No pick_sheet.csv yet. Run the GitHub Action or `python scripts/fetch_and_build.py`.")
     st.stop()
 
-# ---- Filters ----
-top = st.columns([1.2, 1.2, 2, 1.2])
-with top[0]:
-    season = st.selectbox("Season", sorted(df["season"].dropna().unique()))
-w_df = df[df["season"] == season].copy()
+# --- Filters ---
+col1,col2,col3 = st.columns([1,1,2])
+with col1:
+    season = st.selectbox("Season", sorted(df["season"].dropna().unique()), index=len(sorted(df["season"].unique()))-1)
+with col2:
+    weeks = sorted(df.loc[df["season"]==season,"week"].dropna().unique())
+    week = st.selectbox("Week", weeks, index=0)
+with col3:
+    teams = ["(All)"] + sorted(pd.unique(pd.concat([df["home_team"], df["away_team"]]).dropna()))
+    team_filter = st.selectbox("Filter by team (optional)", teams, index=0)
 
-with top[1]:
-    week = st.selectbox("Week", sorted(w_df["week"].dropna().unique()))
-show = w_df[w_df["week"] == week].copy()
+base = df[(df["season"]==season) & (df["week"]==week)].copy()
+if team_filter != "(All)":
+    base = base[(base["home_team"]==team_filter) | (base["away_team"]==team_filter)]
 
-with top[2]:
-    # optional team filter
-    teams = sorted(pd.unique(show[["home_team","away_team"]].values.ravel()))
-    team = st.selectbox("Filter by team (optional)", ["(All)"] + teams)
-    if team != "(All)":
-        show = show[(show["home_team"] == team) | (show["away_team"] == team)]
-
-with top[3]:
-    sort_by_time = st.checkbox("Sort by kickoff time", value=True)
-
-if "gameday" in show.columns and sort_by_time:
-    show = show.sort_values(["gameday","home_team","away_team"])
-
-# Small header
 st.caption("Columns refresh automatically from the repo’s /data/pick_sheet.csv (auto-refresh ~60s).")
 
-# ---- Tabs ----
-tab1, tab2, tab3 = st.tabs(["Moneyline (Model vs Market)", "Spread / ATS", "Totals (O/U)"])
+tabs = st.tabs(["Moneyline (Model vs Market)", "Spread / ATS", "Totals (O/U)"])
 
-# Helper to show only existing cols
-def present(df: pd.DataFrame, cols: list[str]) -> list[str]:
-    return [c for c in cols if c in df.columns]
-
-with tab1:
+# -------------------------------------------------------------------
+# MONEYLINE TAB
+# -------------------------------------------------------------------
+with tabs[0]:
     st.subheader("Moneyline — Market prices & vig-removed fair probabilities")
-    cols = [
-        "gameday","home_team","away_team",
-        "home_ml","away_ml",
-        "home_prob","away_prob",               # fair (vig-removed) from book
-        "home_prob_raw","away_prob_raw",       # raw (vigged) from book
-        # If/when you add model probs in Step 4+, include below:
-        "home_prob_model","away_prob_model",
-        "home_kelly_5pct","away_kelly_5pct",   # if your pipeline computes these
-        "home_rest_days","away_rest_days","rest_delta","travel_km","travel_dir_km",
-    ]
-    st.dataframe(show[present(show, cols)], use_container_width=True)
 
-with tab2:
-    st.subheader("Spread / ATS — Lines, prices, and cover probabilities (vig-removed)")
-    cols = [
-        "gameday","home_team","away_team",
-        "home_spread","away_spread",
-        "home_spread_price","away_spread_price",
-        "home_cover_prob","away_cover_prob",
-        # If/when you add model spread/ATS later, show them here:
-        "model_spread_home","spread_edge_pts","home_cover_model",
-        "home_rest_days","away_rest_days","rest_delta","travel_km","travel_dir_km",
+    cols_to_show = [
+        "gameday", "home_team", "away_team",
+        "home_ml", "away_ml",
+        "home_prob", "away_prob",            # vig-removed market fair prob
+        "home_prob_raw", "away_prob_raw",    # pre-vig implied prob
+        "home_prob_model", "away_prob_model",
+        "home_kelly_5pct", "away_kelly_5pct"
     ]
-    st.dataframe(show[present(show, cols)], use_container_width=True)
+    avail = [c for c in cols_to_show if c in base.columns]
+    if not avail:
+        st.info("No moneyline columns found yet in pick_sheet.csv.")
+    else:
+        st.dataframe(base[avail].sort_values("gameday"), use_container_width=True)
 
-with tab3:
-    st.subheader("Totals (Over/Under) — Line, prices, and probabilities (vig-removed)")
-    cols = [
+    st.caption(
+        "Tip: if you want **DraftKings-only** numbers vs **consensus** (median across books), "
+        "edit the `books` list inside the merge step in `nfl_model/pipeline.py` to `['draftkings']`."
+    )
+
+# -------------------------------------------------------------------
+# SPREAD / ATS TAB (simple placeholder – will populate after you add spreads to pick_sheet)
+# -------------------------------------------------------------------
+with tabs[1]:
+    st.subheader("Spread / ATS — Market vs model edges")
+    cols_spread = [
         "gameday","home_team","away_team",
-        "total_points","over_price","under_price",
-        "over_prob","under_prob",
+        "spread","home_prob_model","away_prob_model",
+        "home_edge","away_edge","home_kelly_5pct","away_kelly_5pct"
     ]
-    st.dataframe(show[present(show, cols)], use_container_width=True)
+    avail2 = [c for c in cols_spread if c in base.columns]
+    if avail2:
+        st.dataframe(base[avail2].sort_values("gameday"), use_container_width=True)
+    else:
+        st.info("Spread/ATS fields will appear once spreads are added to pick_sheet.")
 
-# Helpful note
-st.info(
-    "Tip: If you want **DraftKings-only** numbers vs **consensus** (median across books), "
-    "edit `BOOKS` in `nfl_model/pipeline.py` — set to `['draftkings']` or `[]`."
-)
+# -------------------------------------------------------------------
+# TOTALS TAB (placeholder for when you add totals data)
+# -------------------------------------------------------------------
+with tabs[2]:
+    st.subheader("Totals (O/U) — Coming soon")
+    st.info("Once totals are added to pick_sheet, this tab will populate.")
+
+# Manual reload button
+if st.button("Reload data now"):
+    load_df.clear()
+    st.experimental_rerun()
