@@ -1,61 +1,82 @@
 # nfl_model/pipeline.py
 from __future__ import annotations
 import os, json, pandas as pd
+from .config import DATA_CACHE_DIR
+from .odds import extract_moneylines, extract_spreads, extract_totals
 from .features import build_upcoming_with_features
-from .odds import extract_consensus_moneylines
-from .utils import ensure_dir
 
-CACHE = os.environ.get("DATA_CACHE_DIR", "./cache")
+TEAM_FIX = {"LA":"LAR","STL":"LAR","SD":"LAC","OAK":"LV"}
+def _fix(s: pd.Series) -> pd.Series: return s.replace(TEAM_FIX)
 
-def _load_upcoming() -> pd.DataFrame:
-    """Load the schedule CSV (downloaded by scripts/fetch_and_build.py)."""
-    p = os.path.join(CACHE, "schedule.csv")
-    return pd.read_csv(p, low_memory=False)
+# Set to ["draftkings"] to use ONLY DraftKings; set to [] to use median across all books.
+BOOKS: list[str] = ["draftkings"]   # change to [] for consensus
 
-def _load_history() -> pd.DataFrame:
-    """
-    For now we reuse the same season schedule as 'history' (placeholder).
-    In a later step we'll hydrate multi-season history for training.
-    """
-    p = os.path.join(CACHE, "schedule.csv")
-    return pd.read_csv(p, low_memory=False)
+def _load_schedule(cache: str) -> pd.DataFrame:
+    p = os.path.join(cache, "schedule.csv")
+    df = pd.read_csv(p, low_memory=False)
+    # normalize teams
+    df["home_team"] = _fix(df["home_team"]); df["away_team"] = _fix(df["away_team"])
+    if "gameday" in df.columns:
+        df["gameday"] = pd.to_datetime(df["gameday"], errors="coerce")
+    return df
 
-def _load_odds_df() -> pd.DataFrame:
-    """Turn odds_raw.json into a tidy DF of consensus moneylines + implied probs."""
-    p = os.path.join(CACHE, "odds_raw.json")
+def _load_odds_raw(cache: str):
+    p = os.path.join(cache, "odds_raw.json")
     if not os.path.exists(p):
-        return pd.DataFrame(columns=["home_team","away_team","home_ml","away_ml","home_prob","away_prob"])
+        return None
     with open(p, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-    return extract_consensus_moneylines(raw)
+        return json.load(f)
 
-def build_pick_sheet(cache_dir: str | None = None) -> str:
-    """Create cache/pick_sheet.csv with features + odds columns."""
-    if cache_dir:
-        global CACHE
-        CACHE = cache_dir
+def build_pick_sheet(cache: str = DATA_CACHE_DIR) -> pd.DataFrame:
+    cache = cache or DATA_CACHE_DIR
+    sched = _load_schedule(cache)
 
-    ensure_dir(CACHE)
+    # Upcoming (current & future)
+    up = sched.copy()
+    if "gameday" in up.columns:
+        up = up[up["gameday"] >= pd.Timestamp.today().normalize()]
 
-    upcoming = _load_upcoming()
-    history  = _load_history()
-    odds     = _load_odds_df()
+    # Features (rest/travel for now) using the full season schedule as "history"
+    feats, feat_cols = build_upcoming_with_features(
+        upcoming=up[["season","week","gameday","home_team","away_team","game_id"]],
+        past_sched=sched
+    )
 
-    # === New: add rest/travel features ===
-    feats, feat_cols = build_upcoming_with_features(upcoming, history)
+    # Odds
+    raw = _load_odds_raw(cache)
+    if raw is not None:
+        mls = extract_moneylines(raw, bookmakers=BOOKS if BOOKS else None)
+        spr = extract_spreads(raw,    bookmakers=BOOKS if BOOKS else None)
+        tot = extract_totals(raw,     bookmakers=BOOKS if BOOKS else None)
+    else:
+        mls = spr = tot = pd.DataFrame()
 
-    # Merge odds by (home_team, away_team)
-    out = feats.merge(odds, on=["home_team","away_team"], how="left")
+    out = feats.copy()
 
-    # Order/clean columns
-    cols_front = ["season","week","gameday","home_team","away_team"]
-    metric_cols = ["home_ml","away_ml","home_prob","away_prob"] + feat_cols
-    other_cols = [c for c in out.columns if c not in cols_front + metric_cols]
-    final_cols = cols_front + metric_cols + other_cols
-    out = out[final_cols]
+    if not mls.empty:
+        out = out.merge(mls, on=["home_team","away_team"], how="left")
+    else:
+        for c in ["home_ml","away_ml","home_prob","away_prob","home_prob_raw","away_prob_raw"]:
+            out[c] = None
 
-    # Write
-    out_path = os.path.join(CACHE, "pick_sheet.csv")
+    if not spr.empty:
+        out = out.merge(spr, on=["home_team","away_team"], how="left")
+
+    if not tot.empty:
+        out = out.merge(tot, on=["home_team","away_team"], how="left")
+
+    # Arrange columns
+    order_front = ["season","week","gameday","home_team","away_team","game_id"]
+    ml_cols = ["home_ml","away_ml","home_prob","away_prob","home_prob_raw","away_prob_raw"]
+    sp_cols = ["home_spread","away_spread","home_spread_price","away_spread_price","home_cover_prob","away_cover_prob"]
+    tot_cols= ["total_points","over_price","under_price","over_prob","under_prob"]
+    feat_cols = [c for c in out.columns if c in ("home_rest_days","away_rest_days","rest_delta","travel_km","travel_dir_km")]
+    other = [c for c in out.columns if c not in (order_front + ml_cols + sp_cols + tot_cols + feat_cols)]
+    cols = [c for c in order_front if c in out.columns] + ml_cols + sp_cols + tot_cols + feat_cols + other
+    cols = [c for c in cols if c in out.columns]  # guard
+    out = out[cols]
+
+    out_path = os.path.join(cache, "pick_sheet.csv")
     out.to_csv(out_path, index=False)
     print(f"[pick_sheet] wrote {out_path} ({len(out)} rows)")
-    return out_path
+    return out
