@@ -1,91 +1,110 @@
-# --- BEGIN REPLACEMENT BLOCK (put near top of pipeline.py) ---
+# nfl_model/pipeline.py
 from __future__ import annotations
-import os, json, pandas as pd
-from nfl_model.rest_travel import add_rest_travel
-from nfl_model.features import add_basic_features
-from nfl_model.modeling import model_probs_from_features
-from nfl_model.odds import extract_consensus_moneylines  # we’ll pass books=['draftkings']
+import os, json
+import numpy as np
+import pandas as pd
+import joblib
 
-# Force DraftKings only.  To use consensus across all available books, set BOOKS = [].
-BOOKS = ["draftkings"]
+from .config import DATA_CACHE_DIR
+from .odds import extract_consensus_moneylines  # DK or consensus
+from .features import build_upcoming_with_features
 
-def build_pick_sheet(cache_dir: str = "./cache") -> pd.DataFrame:
-    cache_dir = os.path.abspath(cache_dir)
-    sched_p = os.path.join(cache_dir, "schedule.csv")
-    odds_p  = os.path.join(cache_dir, "odds_raw.json")
+TEAM_FIX = {"LA":"LAR","STL":"LAR","SD":"LAC","OAK":"LV"}
+def _fix(s: pd.Series) -> pd.Series: return s.replace(TEAM_FIX)
 
-    sched = pd.read_csv(sched_p, low_memory=False)
+# Change to ["draftkings"] if you want DK-only; [] = consensus across available books.
+BOOKS: list[str] = []   # start with consensus to maximize fill
 
-    # Normalize team codes in schedule so they match Odds API (HOU/TB/LV/LAC/LAR etc.)
-    sched["home_team"] = sched["home_team"].replace({"LA": "LAR", "SD": "LAC", "OAK": "LV"})
-    sched["away_team"] = sched["away_team"].replace({"LA": "LAR", "SD": "LAC", "OAK": "LV"})
+def _load_schedule(cache: str) -> pd.DataFrame:
+    p = os.path.join(cache, "schedule.csv")
+    df = pd.read_csv(p, low_memory=False)
+    df["home_team"] = _fix(df["home_team"]); df["away_team"] = _fix(df["away_team"])
+    if "gameday" in df.columns:
+        df["gameday"] = pd.to_datetime(df["gameday"], errors="coerce")
+    return df
 
-    # Add rest/travel + any basic features you’ve built
-    sched = add_rest_travel(sched)
-    sched = add_basic_features(sched)
+def _load_odds_raw(cache: str):
+    p = os.path.join(cache, "odds_raw.json")
+    if not os.path.exists(p): return None
+    with open(p, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-    # Load odds and extract DK moneylines + fair probs
-    if os.path.exists(odds_p):
-        with open(odds_p, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        odds = extract_consensus_moneylines(raw, books=BOOKS)  # DraftKings only
-    else:
-        odds = pd.DataFrame(columns=["home_team","away_team","home_ml","away_ml","home_prob","away_prob","home_prob_raw","away_prob_raw"])
+def _load_models():
+    win_art = os.path.join("cache","models","win_clf.pkl")
+    ats_art = os.path.join("cache","models","ats_clf.pkl")
+    win_pack = joblib.load(win_art) if os.path.exists(win_art) else None
+    ats_pack = joblib.load(ats_art) if os.path.exists(ats_art) else None
+    return win_pack, ats_pack
 
-    # Merge by (home_team, away_team). We deliberately do not include date to keep it simple.
-    merged = pd.merge(
-        sched,
-        odds,
-        on=["home_team","away_team"],
-        how="left",
-        suffixes=("","_odds")
+def _kelly_fraction(p: float | None, american_odds: float | None, cap=0.05) -> float:
+    if p is None or american_odds is None or pd.isna(p) or pd.isna(american_odds):
+        return 0.0
+    ml = float(american_odds)
+    b = (ml/100.0) if ml >= 0 else (100.0/(-ml))  # net odds
+    f = (p*(b+1) - 1) / b
+    return 0.0 if f <= 0 else min(float(f), cap)
+
+def build_pick_sheet(cache: str = DATA_CACHE_DIR) -> pd.DataFrame:
+    cache = cache or DATA_CACHE_DIR
+    os.makedirs(cache, exist_ok=True)
+
+    sched = _load_schedule(cache)
+
+    # Limit to today+ for a cleaner dashboard
+    up = sched.copy()
+    if "gameday" in up.columns:
+        up = up[up["gameday"] >= pd.Timestamp.today().normalize()]
+
+    # Build features using full schedule as history context
+    feats, feat_cols = build_upcoming_with_features(
+        upcoming=up[["season","week","gameday","home_team","away_team","game_id"]],
+        past_sched=sched
     )
+    out = feats.copy()
 
-    # Compute model probabilities (from your features)
-    model = model_probs_from_features(merged)
-    merged["home_prob_model"] = model["home_prob_model"]
-    merged["away_prob_model"] = 1.0 - merged["home_prob_model"]
-
-    # Kelly at 5% fraction only when market probs exist
-    def kelly(p, b):
-        # b is net odds (decimal-1), but for moneyline we can derive with American odds
-        return max(p - (1-p)/b, 0) if (b is not None and b != 0) else 0
-
-    def american_to_decimal(ml):
-        if pd.isna(ml):
-            return None
-        ml = float(ml)
-        if ml > 0:
-            return 1 + ml/100.0
+    # Merge moneylines (vig-removed fair probs) from odds
+    raw = _load_odds_raw(cache)
+    if raw is not None:
+        mls = extract_consensus_moneylines(raw, books=BOOKS if BOOKS else None)
+        if not mls.empty:
+            out = out.merge(mls, on=["home_team","away_team"], how="left")
         else:
-            return 1 + 100.0/abs(ml)
+            for c in ["home_ml","away_ml","home_prob","away_prob","home_prob_raw","away_prob_raw"]:
+                out[c] = np.nan
+    else:
+        for c in ["home_ml","away_ml","home_prob","away_prob","home_prob_raw","away_prob_raw"]:
+            out[c] = np.nan
 
-    merged["home_kelly_5pct"] = 0.0
-    merged["away_kelly_5pct"] = 0.0
-    # only compute Kelly if we actually have a moneyline
-    for i, r in merged.iterrows():
-        if pd.notna(r.get("home_ml")) and pd.notna(r.get("away_ml")):
-            dh = american_to_decimal(r["home_ml"])
-            da = american_to_decimal(r["away_ml"])
-            if dh and da:
-                b_h = dh - 1.0
-                b_a = da - 1.0
-                merged.at[i, "home_kelly_5pct"] = 0.05 * kelly(r["home_prob_model"], b_h)
-                merged.at[i, "away_kelly_5pct"] = 0.05 * kelly(1.0 - r["home_prob_model"], b_a)
+    # Add model outputs if artifacts exist
+    win_pack, ats_pack = _load_models()
+    if win_pack is not None and set(win_pack["feat_cols"]).issubset(out.columns):
+        X = out[win_pack["feat_cols"]].fillna(0.0).to_numpy()
+        p_home = win_pack["clf"].predict_proba(X)[:,1]
+        out["home_prob_model"] = p_home
+        out["away_prob_model"] = 1.0 - p_home
 
-    out_cols = [
-        "season","week","gameday","home_team","away_team","game_id",
-        "home_ml","away_ml","home_prob","away_prob","home_prob_raw","away_prob_raw",
-        "home_prob_model","away_prob_model",
-        "home_kelly_5pct","away_kelly_5pct",
-        # include any rest/travel columns you want visible:
-        "home_rest_days","away_rest_days","home_travel_miles","away_travel_miles"
-    ]
-    out_cols = [c for c in out_cols if c in merged.columns]
-    out = merged[out_cols].copy()
+        # model spread (rough mapping)
+        logit = np.log(np.clip(p_home, 1e-6, 1-1e-6) / np.clip(1-p_home, 1e-6, 1))
+        out["model_spread_home"] = (6.8 * logit).round(1)
 
-    out_path = os.path.join(cache_dir, "pick_sheet.csv")
+        # edges vs market fair probs if available
+        if "home_prob" in out.columns:
+            out["home_edge"] = out["home_prob_model"] - out["home_prob"]
+            out["away_edge"] = out["away_prob_model"] - out["away_prob"]
+
+        # Kelly using model probs + market prices
+        out["home_kelly_5pct"] = out.apply(lambda r: _kelly_fraction(r.get("home_prob_model"), r.get("home_ml")), axis=1)
+        out["away_kelly_5pct"] = out.apply(lambda r: _kelly_fraction(r.get("away_prob_model"), r.get("away_ml")), axis=1)
+
+    # Order columns
+    order_front = ["season","week","gameday","home_team","away_team","game_id"]
+    ml_cols = ["home_ml","away_ml","home_prob","away_prob","home_prob_raw","away_prob_raw"]
+    model_cols = ["home_prob_model","away_prob_model","model_spread_home","home_edge","away_edge","home_kelly_5pct","away_kelly_5pct"]
+    keep = [c for c in order_front + ml_cols + model_cols if c in out.columns]
+    keep += [c for c in out.columns if c not in keep]
+
+    out = out[keep]
+    out_path = os.path.join(cache, "pick_sheet.csv")
     out.to_csv(out_path, index=False)
     print(f"[pick_sheet] wrote {out_path} ({len(out)} rows)")
     return out
-# --- END REPLACEMENT BLOCK ---
