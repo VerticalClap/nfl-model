@@ -12,7 +12,7 @@ from .features import build_upcoming_with_features
 TEAM_FIX = {"LA":"LAR","STL":"LAR","SD":"LAC","OAK":"LV"}
 def _fix(s: pd.Series) -> pd.Series: return s.replace(TEAM_FIX)
 
-# Change to ["draftkings"] if you want DK-only; [] = consensus across available books.
+# [] = consensus across all available books; ["draftkings"] = DK-only
 BOOKS: list[str] = []   # start with consensus to maximize fill
 
 def _load_schedule(cache: str) -> pd.DataFrame:
@@ -50,19 +50,19 @@ def build_pick_sheet(cache: str = DATA_CACHE_DIR) -> pd.DataFrame:
 
     sched = _load_schedule(cache)
 
-    # Limit to today+ for a cleaner dashboard
+    # Upcoming window (dashboard shows future games)
     up = sched.copy()
     if "gameday" in up.columns:
         up = up[up["gameday"] >= pd.Timestamp.today().normalize()]
 
-    # Build features using full schedule as history context
+    # Features (uses full schedule as context)
     feats, feat_cols = build_upcoming_with_features(
         upcoming=up[["season","week","gameday","home_team","away_team","game_id"]],
         past_sched=sched
     )
     out = feats.copy()
 
-    # Merge moneylines (vig-removed fair probs) from odds
+    # Moneylines + (vig-removed) fair probs
     raw = _load_odds_raw(cache)
     if raw is not None:
         mls = extract_consensus_moneylines(raw, books=BOOKS if BOOKS else None)
@@ -75,7 +75,7 @@ def build_pick_sheet(cache: str = DATA_CACHE_DIR) -> pd.DataFrame:
         for c in ["home_ml","away_ml","home_prob","away_prob","home_prob_raw","away_prob_raw"]:
             out[c] = np.nan
 
-    # Add model outputs if artifacts exist
+    # Learned models (optional)
     win_pack, ats_pack = _load_models()
     if win_pack is not None and set(win_pack["feat_cols"]).issubset(out.columns):
         X = out[win_pack["feat_cols"]].fillna(0.0).to_numpy()
@@ -83,27 +83,24 @@ def build_pick_sheet(cache: str = DATA_CACHE_DIR) -> pd.DataFrame:
         out["home_prob_model"] = p_home
         out["away_prob_model"] = 1.0 - p_home
 
-        # model spread (rough mapping)
+        # crude mapping to model spread
         logit = np.log(np.clip(p_home, 1e-6, 1-1e-6) / np.clip(1-p_home, 1e-6, 1))
         out["model_spread_home"] = (6.8 * logit).round(1)
 
-        # edges vs market fair probs if available
         if "home_prob" in out.columns:
             out["home_edge"] = out["home_prob_model"] - out["home_prob"]
             out["away_edge"] = out["away_prob_model"] - out["away_prob"]
 
-        # Kelly using model probs + market prices
         out["home_kelly_5pct"] = out.apply(lambda r: _kelly_fraction(r.get("home_prob_model"), r.get("home_ml")), axis=1)
         out["away_kelly_5pct"] = out.apply(lambda r: _kelly_fraction(r.get("away_prob_model"), r.get("away_ml")), axis=1)
 
-    # Order columns
-    order_front = ["season","week","gameday","home_team","away_team","game_id"]
-    ml_cols = ["home_ml","away_ml","home_prob","away_prob","home_prob_raw","away_prob_raw"]
-    model_cols = ["home_prob_model","away_prob_model","model_spread_home","home_edge","away_edge","home_kelly_5pct","away_kelly_5pct"]
-    keep = [c for c in order_front + ml_cols + model_cols if c in out.columns]
-    keep += [c for c in out.columns if c not in keep]
-
+    # Column order
+    front = ["season","week","gameday","home_team","away_team","game_id"]
+    ml = ["home_ml","away_ml","home_prob","away_prob","home_prob_raw","away_prob_raw"]
+    model = ["home_prob_model","away_prob_model","model_spread_home","home_edge","away_edge","home_kelly_5pct","away_kelly_5pct"]
+    keep = [c for c in front + ml + model if c in out.columns] + [c for c in out.columns if c not in front + ml + model]
     out = out[keep]
+
     out_path = os.path.join(cache, "pick_sheet.csv")
     out.to_csv(out_path, index=False)
     print(f"[pick_sheet] wrote {out_path} ({len(out)} rows)")
