@@ -15,7 +15,6 @@ def fetch_schedule_current_season(cache: str) -> pd.DataFrame:
     print(f"[schedule] building schedule for {season}")
     df = nfl.import_schedules([season])
 
-    # normalize columns we need
     if "gameday" in df.columns:
         df["gameday"] = pd.to_datetime(df["gameday"], errors="coerce")
     else:
@@ -24,7 +23,6 @@ def fetch_schedule_current_season(cache: str) -> pd.DataFrame:
                 df["gameday"] = pd.to_datetime(df[alt], errors="coerce")
                 break
 
-    # keep current & future only
     today = pd.Timestamp.today().normalize()
     df = df[df["gameday"] >= today]
 
@@ -40,10 +38,6 @@ def _iso(ts: datetime) -> str:
     return ts.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
 
 def fetch_odds_raw(api_key: str, days_ahead: int = 9) -> list:
-    """
-    Ask for BOTH moneylines (h2h) and spreads, broaden regions,
-    and limit to a near-term window to increase the chance spreads are returned.
-    """
     now = datetime.utcnow()
     params = {
         "apiKey": api_key,
@@ -59,7 +53,6 @@ def fetch_odds_raw(api_key: str, days_ahead: int = 9) -> list:
     r.raise_for_status()
     data = r.json()
 
-    # Debug: list markets we actually got back
     seen = set()
     for ev in data:
         for bk in ev.get("bookmakers", []):
